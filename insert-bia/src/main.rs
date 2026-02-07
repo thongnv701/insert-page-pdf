@@ -1,21 +1,29 @@
-use std::collections::HashMap;
+use calamine::{open_workbook, Reader, Xlsx};
+use log::{error, info, warn};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use calamine::{open_workbook, Reader, Xlsx};
-use log::{error, info, warn};
+
+#[derive(Debug)]
+struct PreviewResults {
+    will_process: usize,
+    will_skip: usize,
+    unmapped_entries: usize,
+    unmapped_excel_entries: Vec<String>,
+}
 
 fn find_project_root() -> Option<PathBuf> {
     let mut current = env::current_dir().ok()?;
-    
+
     loop {
         let cargo_toml = current.join("Cargo.toml");
         if cargo_toml.exists() {
             return Some(current);
         }
-        
+
         match current.parent() {
             Some(parent) => current = parent.to_path_buf(),
             None => return None,
@@ -30,15 +38,52 @@ fn check_qpdf_installed() -> bool {
     }
 }
 
+fn analyze_pdf_files(pdf_files: &[PathBuf], mappings: &HashMap<String, u32>) -> PreviewResults {
+    let mut will_process = 0;
+    let mut will_skip = 0;
+    let mut used_mappings = HashSet::new();
+
+    // Analyze each PDF to see if it will be processed
+    for pdf_path in pdf_files {
+        if let Some(filename) = pdf_path.file_name().and_then(|n| n.to_str()) {
+            if let Some((_page_index, used_key)) = match_pdf_name_with_key(filename, mappings) {
+                will_process += 1;
+                used_mappings.insert(used_key);
+            } else {
+                will_skip += 1;
+            }
+        }
+    }
+
+    // Find unmapped Excel entries
+    let mut unmapped_excel_entries = Vec::new();
+    for excel_name in mappings.keys() {
+        if !used_mappings.contains(excel_name) {
+            unmapped_excel_entries.push(excel_name.clone());
+        }
+    }
+    let unmapped_entries = unmapped_excel_entries.len();
+
+    // Sort for consistent output
+    unmapped_excel_entries.sort();
+
+    PreviewResults {
+        will_process,
+        will_skip,
+        unmapped_entries,
+        unmapped_excel_entries,
+    }
+}
+
 fn main() {
     // Initialize logger with default level if not set
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
     env_logger::init();
-    
+
     println!("Starting PDF page insertion tool...");
-    
+
     // Check if qpdf is installed
     if !check_qpdf_installed() {
         println!("\n=== ERROR ===");
@@ -52,37 +97,38 @@ fn main() {
         return;
     }
     println!("✓ qpdf found");
-    
+
     // Get current working directory (where compare.xlsx and bia.pdf should be)
     let source_dir = match find_project_root() {
         Some(dir) => dir,
-        None => {
-            match env::current_dir() {
-                Ok(dir) => dir,
-                Err(e) => {
-                    error!("Failed to get current directory: {}", e);
-                    return;
-                }
+        None => match env::current_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                error!("Failed to get current directory: {}", e);
+                return;
             }
-        }
+        },
     };
-    
+
     // Validate required files exist in source directory
     let excel_path = source_dir.join("compare.xlsx");
     let bia_path = source_dir.join("bia.pdf");
-    
+
     if !excel_path.exists() {
-        error!("compare.xlsx not found in directory: {}", source_dir.display());
+        error!(
+            "compare.xlsx not found in directory: {}",
+            source_dir.display()
+        );
         println!("ERROR: compare.xlsx not found in: {}", source_dir.display());
         return;
     }
-    
+
     if !bia_path.exists() {
         error!("bia.pdf not found in directory: {}", source_dir.display());
         println!("ERROR: bia.pdf not found in: {}", source_dir.display());
         return;
     }
-    
+
     // Get page count from bia.pdf using pdfcpu
     println!("Loading bia.pdf from: {}", bia_path.display());
     let bia_page_count = match get_pdf_page_count(&bia_path) {
@@ -94,28 +140,30 @@ fn main() {
         }
     };
     println!("bia.pdf has {} pages", bia_page_count);
-    
+
     // Prompt for directory path (where PDF files to process are located)
     print!("Enter directory path: ");
     io::stdout().flush().unwrap();
-    
+
     let mut input = String::new();
-    io::stdin().read_line(&mut input).expect("Failed to read input");
+    io::stdin()
+        .read_line(&mut input)
+        .expect("Failed to read input");
     let dir_path = input.trim();
-    
+
     if dir_path.is_empty() {
         error!("Directory path cannot be empty");
         return;
     }
-    
+
     let base_dir = Path::new(dir_path);
-    
+
     // Validate directory exists
     if !base_dir.exists() || !base_dir.is_dir() {
         error!("Directory does not exist: {}", dir_path);
         return;
     }
-    
+
     info!("Reading compare.xlsx...");
     let mappings = match read_excel_mappings(&excel_path) {
         Ok(m) => m,
@@ -125,9 +173,9 @@ fn main() {
             return;
         }
     };
-    
+
     info!("Found {} mappings in Excel file", mappings.len());
-    
+
     // Scan child directories for PDF files
     let pdf_files = match scan_child_directories(base_dir) {
         Ok(files) => files,
@@ -137,51 +185,118 @@ fn main() {
             return;
         }
     };
-    
+
     if pdf_files.is_empty() {
         warn!("No PDF files found in child directories");
         println!("ERROR: No PDF files found in child directories!");
         return;
     }
-    
+
     info!("Found {} PDF files in subdirectories", pdf_files.len());
+
+    // Query/Preview mode: analyze what will be processed
+    println!("\n=== PREVIEW MODE ===");
+    let preview_results = analyze_pdf_files(&pdf_files, &mappings);
+
+    println!("\nStatistics:");
+    println!("  Will process: {}", preview_results.will_process);
+    println!("  Will skip:    {}", preview_results.will_skip);
+    println!("  Total PDFs:   {}", pdf_files.len());
+
+    if preview_results.unmapped_entries > 0 {
+        println!("\n⚠ Warnings:");
+        for excel_name in &preview_results.unmapped_excel_entries {
+            println!("  - No PDF found for Excel entry: {}", excel_name);
+        }
+        println!(
+            "  Total unmapped entries: {}",
+            preview_results.unmapped_entries
+        );
+    }
+
+    // Ask user for confirmation
+    println!("\n=== CONFIRMATION ===");
+    print!("Do you want to proceed? (y/n): ");
+    io::stdout().flush().unwrap();
+
+    let mut confirm = String::new();
+    io::stdin()
+        .read_line(&mut confirm)
+        .expect("Failed to read input");
+
+    let confirm = confirm.trim().to_lowercase();
+    if confirm != "y" && confirm != "yes" {
+        println!("Operation cancelled by user.");
+        info!("Operation cancelled by user");
+        return;
+    }
+
     println!("\nProcessing {} files...\n", pdf_files.len());
-    
-    // Process PDFs
+
+    // Process PDFs and track which Excel entries were used
     let mut processed = 0;
     let mut skipped = 0;
     let mut errors = 0;
-    
+    let mut used_mappings = std::collections::HashSet::new();
+
     for pdf_path in pdf_files {
         match process_pdf_with_qpdf(&pdf_path, &bia_path, &mappings, bia_page_count) {
-            Ok(true) => {
+            Ok((true, used_key)) => {
                 processed += 1;
-                let filename = pdf_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                used_mappings.insert(used_key);
+                let filename = pdf_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
                 println!("✓ {}", filename);
                 info!("Processed: {}", pdf_path.display());
             }
-            Ok(false) => {
+            Ok((false, _)) => {
                 skipped += 1;
-                let filename = pdf_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
-                println!("⊘ {} (skipped - no match in Excel)", filename);
-                warn!("Skipped: {} (no match in Excel)", pdf_path.display());
+                let filename = pdf_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
+                println!("⊘ {} (skipped)", filename);
+                info!("Skipped: {}", pdf_path.display());
             }
             Err(e) => {
                 errors += 1;
-                let filename = pdf_path.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                let filename = pdf_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown");
                 println!("✗ {} - Error: {}", filename, e);
                 error!("Error processing {}: {}", pdf_path.display(), e);
             }
         }
     }
-    
+
+    // Warn about Excel entries that had no matching PDF files
+    println!("\n=== Warnings ===");
+    let mut unmapped_count = 0;
+    for excel_name in mappings.keys() {
+        if !used_mappings.contains(excel_name) {
+            println!("⚠ No PDF found for Excel entry: {}", excel_name);
+            warn!("No PDF found for Excel entry: {}", excel_name);
+            unmapped_count += 1;
+        }
+    }
+
+    if unmapped_count == 0 {
+        println!("No warnings - all Excel entries were matched!");
+    }
+
     // Summary
     println!("\n=== Summary ===");
     println!("Processed: {}", processed);
     println!("Skipped: {}", skipped);
     println!("Errors: {}", errors);
-    info!("Summary: {} processed, {} skipped, {} errors", processed, skipped, errors);
-    
+    info!(
+        "Summary: {} processed, {} skipped, {} errors",
+        processed, skipped, errors
+    );
+
     // Keep terminal open for user to see results
     println!("\nPress Enter to close...");
     io::stdout().flush().unwrap();
@@ -194,27 +309,29 @@ fn get_pdf_page_count(pdf_path: &Path) -> Result<usize, Box<dyn std::error::Erro
     let output = Command::new("qpdf")
         .args(["--show-npages", pdf_path.to_str().unwrap()])
         .output()?;
-    
+
     if !output.status.success() {
         return Err(format!("qpdf failed: {}", String::from_utf8_lossy(&output.stderr)).into());
     }
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let count = stdout.trim().parse::<usize>()?;
-    
+
     Ok(count)
 }
 
-fn read_excel_mappings(excel_path: &Path) -> Result<HashMap<String, u32>, Box<dyn std::error::Error>> {
+fn read_excel_mappings(
+    excel_path: &Path,
+) -> Result<HashMap<String, u32>, Box<dyn std::error::Error>> {
     let mut workbook: Xlsx<_> = open_workbook(excel_path)?;
     let mut mappings = HashMap::new();
-    
+
     if let Some(Ok(range)) = workbook.worksheet_range_at(0) {
         for row in range.rows() {
             if row.len() < 2 {
                 continue;
             }
-            
+
             // Column A: filename
             let filename_cell = &row[0];
             let filename = match filename_cell {
@@ -223,11 +340,11 @@ fn read_excel_mappings(excel_path: &Path) -> Result<HashMap<String, u32>, Box<dy
                 calamine::Data::Int(i) => i.to_string(),
                 _ => continue,
             };
-            
+
             if filename.is_empty() {
                 continue;
             }
-            
+
             // Column B: page number
             let page_cell = &row[1];
             let page_num = match page_cell {
@@ -235,25 +352,25 @@ fn read_excel_mappings(excel_path: &Path) -> Result<HashMap<String, u32>, Box<dy
                 calamine::Data::Float(f) => *f as u32,
                 _ => continue,
             };
-            
+
             if page_num == 0 {
                 continue;
             }
-            
+
             // Store 0-based page index
             let page_index = page_num - 1;
-            
+
             // Normalize filename: remove path, keep only filename
             let filename_only = Path::new(&filename)
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(&filename)
                 .to_string();
-            
+
             mappings.insert(filename_only, page_index);
         }
     }
-    
+
     Ok(mappings)
 }
 
@@ -264,7 +381,7 @@ fn normalize_filename(filename: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(filename)
         .to_string();
-    
+
     // Remove .pdf extension for comparison
     filename_only
         .strip_suffix(".pdf")
@@ -275,7 +392,7 @@ fn normalize_filename(filename: &str) -> String {
 
 fn extract_base_name(filename: &str) -> String {
     let normalized = normalize_filename(filename);
-    
+
     // Remove anything after and including parentheses: "hoa (1)" -> "hoa", "hoa(2)" -> "hoa"
     // This allows hoa.pdf, hoa (1).pdf, hoa (2).pdf, etc. to all match "hoa"
     let base = if let Some(pos) = normalized.find(" (") {
@@ -285,67 +402,70 @@ fn extract_base_name(filename: &str) -> String {
     } else {
         normalized
     };
-    
+
     base
 }
 
-fn match_pdf_name(pdf_filename: &str, mappings: &HashMap<String, u32>) -> Option<u32> {
+fn match_pdf_name_with_key(
+    pdf_filename: &str,
+    mappings: &HashMap<String, u32>,
+) -> Option<(u32, String)> {
     let pdf_base = normalize_filename(pdf_filename);
-    
+
     // Try exact match first: "hoa" matches "hoa"
     if let Some(&page) = mappings.get(&pdf_base) {
-        return Some(page);
+        return Some((page, pdf_base));
     }
-    
+
     // Try with .pdf extension: "hoa" matches "hoa.pdf"
     let pdf_with_ext = format!("{}.pdf", pdf_base);
     if let Some(&page) = mappings.get(&pdf_with_ext) {
-        return Some(page);
+        return Some((page, pdf_with_ext));
     }
-    
+
     // Only match files with "(1)" - the first duplicate, ignore (2), (3), etc.
     // "hoa (1).pdf" -> extract base "hoa" and check if has "(1)"
-    
+
     // Check if this is a "(1)" file (the first duplicate)
     let has_number_one = pdf_filename.contains("(1)") || pdf_filename.contains("(1).");
-    
+
     if has_number_one {
         let pdf_base_name = extract_base_name(pdf_filename);
-        
+
         // Check all mappings for exact base name match
         // "hoa (1).pdf" extracts "hoa", matches Excel "hoa"
         if let Some(&page) = mappings.get(&pdf_base_name) {
-            return Some(page);
+            return Some((page, pdf_base_name));
         }
-        
+
         // Check if any Excel entry matches when we extract its base name
         for (excel_filename, &page) in mappings.iter() {
             let excel_base_name = extract_base_name(excel_filename);
-            
+
             // Match base names: both extract to same base name
             if pdf_base_name == excel_base_name {
-                return Some(page);
+                return Some((page, excel_filename.clone()));
             }
         }
     }
-    
+
     None
 }
 
 fn scan_child_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut pdf_files = Vec::new();
-    
+
     // Scan only direct child directories (one level deep)
     for entry in fs::read_dir(base_dir)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_dir() {
             // Scan PDF files in this child directory
             for file_entry in fs::read_dir(&path)? {
                 let file_entry = file_entry?;
                 let file_path = file_entry.path();
-                
+
                 if file_path.is_file() {
                     if let Some(ext) = file_path.extension() {
                         if ext.eq_ignore_ascii_case("pdf") {
@@ -356,7 +476,7 @@ fn scan_child_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
             }
         }
     }
-    
+
     Ok(pdf_files)
 }
 
@@ -365,37 +485,36 @@ fn process_pdf_with_qpdf(
     bia_path: &Path,
     mappings: &HashMap<String, u32>,
     bia_page_count: usize,
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<(bool, String), Box<dyn std::error::Error>> {
     let filename = pdf_path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or("Invalid filename")?;
-    
-    // Match PDF with Excel entries
-    let page_index = match match_pdf_name(filename, mappings) {
-        Some(idx) => idx,
-        None => return Ok(false), // No match, skip
+
+    // Match PDF with Excel entries and get the used key
+    let (page_index, used_key) = match match_pdf_name_with_key(filename, mappings) {
+        Some((idx, key)) => (idx, key),
+        None => return Ok((false, String::new())), // No match, skip
     };
-    
+
     // Convert to 1-based page number
     let page_number = page_index + 1;
-    
+
     // Validate page number
     if page_number as usize > bia_page_count {
         return Err(format!(
             "Page number {} exceeds bia.pdf page count ({})",
-            page_number,
-            bia_page_count
+            page_number, bia_page_count
         )
         .into());
     }
-    
+
     println!("  Inserting page {} from bia.pdf", page_number);
-    
+
     // Create temp file for output
     let temp_dir = env::temp_dir();
     let temp_output_pdf = temp_dir.join(format!("merged_output_{}.pdf", std::process::id()));
-    
+
     // Use qpdf to combine: page from bia.pdf first, then all pages from target PDF
     // qpdf --empty --pages bia.pdf N target.pdf -- output.pdf
     // Use --warning-exit-0 to return success even with warnings (common in non-standard PDFs)
@@ -411,22 +530,22 @@ fn process_pdf_with_qpdf(
             temp_output_pdf.to_str().unwrap(),
         ])
         .output()?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("Failed to merge PDFs with qpdf: {}", stderr).into());
     }
-    
+
     // Verify output exists
     if !temp_output_pdf.exists() {
         return Err("Failed to create merged PDF".into());
     }
-    
+
     // Replace original file with merged output
     fs::copy(&temp_output_pdf, pdf_path)?;
-    
+
     // Clean up temp file
     let _ = fs::remove_file(&temp_output_pdf);
-    
-    Ok(true)
+
+    Ok((true, used_key))
 }
